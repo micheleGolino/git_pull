@@ -2,24 +2,32 @@
 # -----------------------------------------------------------------------------
 # Walk every Git repository below a root folder and run
 # `git pull --ff-only` on each local branch that tracks a remote.
-# Errors never stop the loop; they are collected for the final report.
+# Repositories are processed in parallel (default: 4 at a time).
+# Works on macOS (Bash 3.2) and any modern Linux distribution.
 # -----------------------------------------------------------------------------
 
-set -euo pipefail   # fail on unset vars and pipe errors, exit on other errors
+set -euo pipefail   # exit on most errors, fail on unset vars and pipe errors
 
-ROOT_DIR="${1:-$HOME/git}"   # default root is $HOME/git unless given as $1
+# -------------------------- Configuration ------------------------------------
+ROOT_DIR="${1:-$HOME/git}"   # root folder to scan
+MAX_JOBS="${2:-4}"           # maximum concurrent repositories
 
-declare -a SUCCESSFUL_PULLS=()
-declare -a FAILED_PULLS=()
+# Temporary files to collect results (atomic appends are POSIX‑safe)
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gitpull.XXXXXX")"
+SUCCESS_FILE="$TMP_DIR/success.log"
+FAIL_FILE="$TMP_DIR/fail.log"
+: >"$SUCCESS_FILE"  # truncate / create
+: >"$FAIL_FILE"
 
+# -------------------------- Functions ----------------------------------------
 pull_repository() {
   local repo_path="$1"
 
-  # Remember the branch that was active when we entered the repo
+  # Remember current branch
   local original_branch
   original_branch=$(git -C "$repo_path" rev-parse --abbrev-ref HEAD)
 
-  # Collect all local branches that track a remote (portable: no `mapfile`)
+  # Get all local branches that track a remote (portable: no mapfile/readarray)
   local branches=()
   while read -r local_branch _; do
     branches+=("$local_branch")
@@ -29,34 +37,60 @@ pull_repository() {
     awk '$2 != "" {print $1}'
   )
 
-  # Update each tracked branch
+  # Pull each tracked branch
   for br in "${branches[@]}"; do
-    git -C "$repo_path" checkout -q "$br" || continue
+    git -C "$repo_path" checkout -q "$br" || {
+      echo "${repo_path}:${br}" >>"$FAIL_FILE"
+      continue
+    }
     if git -C "$repo_path" pull --ff-only --quiet; then
-      SUCCESSFUL_PULLS+=("${repo_path}:${br}")
+      echo "${repo_path}:${br}" >>"$SUCCESS_FILE"
     else
-      FAILED_PULLS+=("${repo_path}:${br}")
+      echo "${repo_path}:${br}" >>"$FAIL_FILE"
     fi
   done
 
-  # Restore the original branch
+  # Restore original branch
   git -C "$repo_path" checkout -q "$original_branch"
 }
 
-# Discover every `.git` directory and process the parent folder
+spawn_job() {
+  pull_repository "$1" &
+}
+
+# -------------------------- Main loop ----------------------------------------
+echo "Scanning $ROOT_DIR …"
 while IFS= read -r -d '' git_dir; do
   repo_dir="$(dirname "$git_dir")"
-  echo ">> Processing $repo_dir"
-  pull_repository "$repo_dir" || true   # never stop on a single failure
+  echo ">> Queuing  $repo_dir"
+  spawn_job "$repo_dir"
+
+  # Throttle concurrency: wait until running jobs < MAX_JOBS
+  while (( $(jobs -p | wc -l | tr -d ' ') >= MAX_JOBS )); do
+    sleep 0.5
+  done
 done < <(find "$ROOT_DIR" -type d -name ".git" -print0)
 
-# ---------- Final report -----------------------------------------------------
+wait   # wait for all background jobs to finish
+
+# -------------------------- Final report -------------------------------------
 echo
 echo "==================== PULL REPORT ===================="
 echo "---- FAILED PULLS ----"
-((${#FAILED_PULLS[@]})) && printf '%s\n' "${FAILED_PULLS[@]}" || echo "None"
+if [[ -s "$FAIL_FILE" ]]; then
+  sort "$FAIL_FILE"
+else
+  echo "None"
+fi
 
 echo
 echo "---- SUCCESSFUL PULLS ----"
-((${#SUCCESSFUL_PULLS[@]})) && printf '%s\n' "${SUCCESSFUL_PULLS[@]}" || echo "None"
+if [[ -s "$SUCCESS_FILE" ]]; then
+  sort "$SUCCESS_FILE"
+else
+  echo "None"
+fi
 echo "====================================================="
+
+# Cleanup
+rm -rf "$TMP_DIR"
